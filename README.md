@@ -1,41 +1,27 @@
 # Intelligent Order Risk & Routing System
 
-A production-shaped fraud detection and decision-automation service. Each
-inbound order is scored by a calibrated XGBoost model, routed to one of
-**auto-approve / manual review / auto-reject**, and accompanied by a
-SHAP-based explanation suitable for analysts and chargeback evidence.
+A fraud detection and decision automation service for e-commerce orders. Each inbound order receives a calibrated risk score from an XGBoost model, gets routed to one of three outcomes (auto-approve, manual review, auto-reject), and arrives with a SHAP-based explanation suitable for analysts and chargeback evidence.
 
-Trained on the [IEEE-CIS Fraud Detection](https://www.kaggle.com/competitions/ieee-fraud-detection)
-dataset (~590k transactions, ~3.5% fraud).
-
----
+The model trains on the [IEEE-CIS Fraud Detection](https://www.kaggle.com/competitions/ieee-fraud-detection) dataset of roughly 590,000 transactions with a 3.4% fraud rate.
 
 ## The business problem
 
-Card-not-present fraud is asymmetric:
+Card-not-present fraud carries asymmetric costs.
 
 | Outcome | What it costs |
 |---|---|
-| **False negative** (approve a fraud) | Full transaction value + chargeback fee (typ. $15–$50) + scheme penalty if your fraud rate trips a threshold. Direct P&L hit. |
-| **False positive** (reject a good order) | Lost revenue on the order **plus** the lifetime value of a customer who hits a "your card was declined" page. Industry benchmarks put the LTV cost at 5–10× the order value. |
-| **Manual review** | Analyst time (~$2–$5 per case). Cheap relative to either error, **if** your queue is sized correctly. |
+| False negative (approving a fraud) | The full transaction value, a chargeback fee of $15 to $50, and a scheme penalty if the merchant fraud rate trips a threshold. A direct hit to P&L. |
+| False positive (rejecting a good order) | The order revenue, plus the lifetime value of a customer who hits a "your card was declined" page. Industry benchmarks place the LTV cost at five to ten times the order value. |
+| Manual review | Analyst time, roughly $2 to $5 per case. Cheap relative to either error, provided the queue stays sized for capacity. |
 
-A single point estimate (e.g. "score > 0.5 → block") collapses this nuance.
-Risk teams need:
+A single point estimate ("score above 0.5 blocks") collapses this nuance. Risk teams need four things instead.
 
-1. A **calibrated probability** they can reason about — a 0.7 should mean
-   "70% of orders like this are fraudulent," not "this came out higher than
-   the other one."
-2. **Configurable thresholds** so ops can re-tune as the fraud mix shifts
-   without retraining.
-3. A **review band** so the model can punt low-confidence cases to humans
-   instead of guessing.
-4. A **reason** for every decision — for analyst efficiency, for chargeback
-   representment, and for regulatory defensibility.
+1. A calibrated probability they can reason about. A score of 0.7 should mean that 70% of orders like this are fraudulent, which differs from "this came out higher than the other one."
+2. Configurable thresholds, so operations can re-tune as the fraud mix shifts. The model artifacts stay frozen between tunings.
+3. A review band, so the model hands low-confidence cases to humans for adjudication.
+4. A reason for every decision, for analyst efficiency, chargeback representment, and regulatory defensibility.
 
 This service provides all four.
-
----
 
 ## Architecture
 
@@ -65,17 +51,17 @@ This service provides all four.
                          └───────────────┘
 ```
 
-Repo layout:
+Repository layout:
 
 ```
 order-risk-engine/
 ├── data/                   # CSVs go here (gitignored)
-├── pipeline/               # data loading + feature engineering + sklearn ColumnTransformer
+├── pipeline/               # data loading, feature engineering, sklearn ColumnTransformer
 ├── model/
-│   ├── train.py            # end-to-end training + calibration
-│   ├── decision.py         # DecisionPolicy + threshold sweep
+│   ├── train.py            # end-to-end training and calibration
+│   ├── decision.py         # DecisionPolicy and threshold sweep
 │   ├── explain.py          # SHAP TreeExplainer wrapper
-│   └── artifacts/          # joblib + json outputs
+│   └── artifacts/          # joblib and json outputs
 ├── api/                    # FastAPI app
 ├── dashboard/              # Streamlit operator console
 ├── monitoring/             # Evidently drift report
@@ -85,11 +71,9 @@ order-risk-engine/
 └── requirements.txt
 ```
 
----
-
 ## Setup
 
-Requires Python 3.11+.
+Requires Python 3.11 or newer.
 
 ```bash
 python -m venv .venv
@@ -99,7 +83,7 @@ pip install -r requirements.txt
 
 ### 1. Get the data
 
-Download the IEEE-CIS competition data and unzip it into `data/`:
+Download the IEEE-CIS competition data and unzip it into `data/`.
 
 ```bash
 # requires `kaggle` CLI configured
@@ -107,10 +91,7 @@ kaggle competitions download -c ieee-fraud-detection -p data/
 unzip -o data/ieee-fraud-detection.zip -d data/
 ```
 
-Or download manually from
-<https://www.kaggle.com/competitions/ieee-fraud-detection/data> and place
-`train_transaction.csv` and `train_identity.csv` in `data/`. See
-`data/README.md` for the schema.
+You can also download the files manually from <https://www.kaggle.com/competitions/ieee-fraud-detection/data> and place `train_transaction.csv` and `train_identity.csv` in `data/`. The schema lives in `data/README.md`.
 
 ### 2. Train
 
@@ -118,38 +99,34 @@ Or download manually from
 python -m model.train
 ```
 
-This:
-- merges transaction + identity tables on `TransactionID`
-- engineers velocity features (rolling count/sum/mean per card over the
-  last 5/20/100 transactions)
-- splits chronologically (60/20/20 train/calibration/validation) — random
-  splits leak future information on this dataset
-- fits XGBoost with `scale_pos_weight = neg/pos`
-- wraps with `CalibratedClassifierCV(method="sigmoid", cv="prefit")` for
-  Platt scaling on the held-out calibration slice
-- writes:
+This step:
+
+- merges the transaction and identity tables on `TransactionID`,
+- engineers velocity features (per-card rolling count, sum, and mean over the last 5, 20, and 100 transactions),
+- splits chronologically (60/20/20 train, calibration, validation), since random splits leak future information on this dataset,
+- fits XGBoost with `scale_pos_weight = neg/pos`,
+- wraps the trained pipeline with `CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")` for Platt scaling on the held-out calibration slice,
+- writes the artifacts:
   - `model/artifacts/calibrated_pipeline.joblib`
-  - `model/artifacts/booster.joblib`  (raw booster for SHAP)
+  - `model/artifacts/booster.joblib` (raw booster for SHAP)
   - `model/artifacts/preprocessor.joblib`
   - `model/artifacts/feature_names.joblib`
-  - `model/artifacts/metrics.json`     (ROC-AUC, PR-AUC, F1, threshold sweep)
-  - `model/artifacts/policy.json`      (default thresholds)
-  - `model/artifacts/validation_sample.parquet` (reference for drift monitor)
+  - `model/artifacts/metrics.json` (ROC-AUC, PR-AUC, F1, threshold sweep)
+  - `model/artifacts/policy.json` (default thresholds)
+  - `model/artifacts/validation_sample.parquet` (reference frame for the drift monitor)
 
-Performance on the IEEE-CIS held-out chronological validation slice
-(118k rows, ~3.4% positives):
+Performance on the IEEE-CIS held-out chronological validation slice (118k rows, around 3.4% positives):
 
-- ROC-AUC: **0.874**
-- PR-AUC: **0.450**  (≈13× the no-skill baseline of 0.034)
-- F1 at default `reject_above=0.65`: **0.420**
-- Brier score: **0.023** (naive baseline 0.032 — calibration adds real lift)
+| Metric | Value |
+|---|---|
+| ROC-AUC | 0.874 |
+| PR-AUC | 0.450 (roughly 13× the no-skill baseline of 0.034) |
+| F1 at default `reject_above=0.65` | 0.420 |
+| Brier score | 0.023 (against a naive baseline of 0.032, so calibration adds real lift) |
 
-At the default reject threshold the model blocks ~1.3% of orders at
-~78% precision and ~29% recall. The full precision/recall/F1 sweep across
-thresholds 0.05–0.95 is in `metrics.json` and visible in the dashboard's
-**Threshold tradeoff** tab.
+At the default reject threshold the model blocks roughly 1.3% of orders at 78% precision and 29% recall. The full precision, recall, and F1 sweep across thresholds 0.05 to 0.95 lives in `metrics.json` and renders in the dashboard's "Threshold tradeoff" tab.
 
-(Numbers will vary slightly with random seed and XGBoost version.)
+Numbers vary slightly with random seed and XGBoost version.
 
 ### 3. Serve
 
@@ -191,9 +168,7 @@ Response:
 }
 ```
 
-Top SHAP contributors are typically Vesta's anonymized count/timedelta
-columns (`C*`, `D*`); the human-meaningful fields rarely crack the top 5.
-See **Feature-store dependency** below for why.
+Top SHAP contributors come overwhelmingly from Vesta's anonymized count and timedelta columns (`C*`, `D*`). The "Feature store dependency" section below explains why.
 
 ### 4. Operator dashboard
 
@@ -201,9 +176,7 @@ See **Feature-store dependency** below for why.
 streamlit run dashboard/app.py
 ```
 
-Lets you submit a sample order, see the score and decision, visualise SHAP
-contributions, and re-tune thresholds against the saved precision/recall
-sweep without retraining.
+The dashboard lets an operator submit a sample order, see the score and decision, visualize SHAP contributions, and re-tune thresholds against the saved precision and recall sweep. The model stays frozen throughout.
 
 ### 5. Drift monitoring
 
@@ -212,9 +185,7 @@ python -m monitoring.drift_report
 open monitoring/reports/drift_report.html
 ```
 
-Generates a synthetic-drift comparison (amount inflation, device-mix shift,
-card-testing-style velocity spikes) against the held-out validation slice
-using Evidently's data-drift, target-drift, and classification presets.
+This generates a synthetic-drift comparison (amount inflation, device-mix shift, card-testing-style velocity spikes) against the held-out validation slice using Evidently's data drift, target drift, and classification presets.
 
 ### 6. Tests
 
@@ -222,14 +193,11 @@ using Evidently's data-drift, target-drift, and classification presets.
 pytest -q
 ```
 
-The included tests don't require trained artifacts — they cover the
-decision policy and feature-engineering invariants.
-
----
+The included tests cover the decision policy and the feature-engineering invariants. They run on stub data alone, so the suite passes on a fresh clone before any training has happened.
 
 ## Decision policy
 
-Default thresholds (in `model/artifacts/policy.json`):
+Default thresholds live in `model/artifacts/policy.json`.
 
 | Score band     | Decision        |
 |----------------|-----------------|
@@ -237,100 +205,36 @@ Default thresholds (in `model/artifacts/policy.json`):
 | `0.05 – 0.65`  | `manual_review` |
 | `< 0.05`       | `auto_approve`  |
 
-> **Why these numbers, not 0.40 / 0.85?** Platt scaling on the IEEE-CIS
-> data (~3.4% positives) compresses calibrated scores — the maximum score
-> on the held-out validation slice is ~0.76, so a 0.85 reject threshold
-> never fires. The defaults above were chosen against the actual
-> validation sweep: `reject_above=0.65` blocks ~1.3% of orders at ~78%
-> precision and ~29% recall, and below `approve_below=0.05` the observed
-> fraud rate is ~1.25% — confidently low enough to auto-approve.
+These defaults reflect the calibrated score distribution on this dataset. Platt scaling on rare-positive data (~3.4% fraud) compresses scores. The maximum score on the held-out validation slice sits at 0.76, so a 0.85 reject threshold would lie above the entire observed range. The thresholds above came from the actual validation sweep: `reject_above=0.65` blocks roughly 1.3% of orders at 78% precision and 29% recall, and orders below `approve_below=0.05` show an observed fraud rate of 1.25%, low enough to auto-approve with confidence.
 
-`metrics.json` contains a precision/recall/F1 sweep across `reject_above`
-from 0.05 to 0.95. The dashboard's **Threshold tradeoff** tab lets ops walk
-that curve interactively and pick a setting based on the current cost
-balance (chargeback rate, manual-review queue capacity, FP tolerance).
+`metrics.json` holds a precision, recall, and F1 sweep across `reject_above` from 0.05 to 0.95. The dashboard's "Threshold tradeoff" tab walks that curve interactively, so operations can pick a setting based on the current cost balance (chargeback rate, manual-review queue capacity, false-positive tolerance).
 
-Thresholds are stored separately from the model so risk operations can
-re-tune them without a retraining cycle.
+Thresholds live separately from the model, so risk operations can re-tune them while the model artifacts stay frozen.
 
-## ⚠ Feature-store dependency
+## Feature store dependency
 
-Most of the discriminative signal in the IEEE-CIS dataset comes from
-**Vesta's anonymized count / timedelta columns** (`C1..C14`, `D1..D15`)
-and the engineered velocity features. SHAP confirms it: the top-5
-contributing features for almost every prediction are `C13`, `C1`,
-`D1`, and the velocity counts.
+Most of the discriminative signal in the IEEE-CIS dataset comes from Vesta's anonymized count and timedelta columns (`C1..C14`, `D1..D15`) along with the engineered velocity features. SHAP confirms it: the top 5 contributing features for almost every prediction draw from `C13`, `C1`, `D1`, and the velocity counts.
 
-That has a direct consequence for the API contract:
+This shapes the API contract.
 
-- An API call that supplies only the **human-meaningful fields**
-  (TransactionAmt, ProductCD, card4, P_emaildomain, DeviceType, …) will
-  score nearly every order around the base rate — the model has no
-  recent-history signal to differentiate them.
-- A useful production caller has to supply, or the API has to look up,
-  per-card recent-history features (counts on the card in the last
-  N hours, time since last transaction, etc.) keyed by `card1` /
-  card hash.
+- An API call that supplies only the human-meaningful fields (`TransactionAmt`, `ProductCD`, `card4`, `P_emaildomain`, `DeviceType`, and so on) will score nearly every order at the base rate. The model needs the recent-history signal to differentiate orders.
+- A useful production caller supplies, or the API looks up, per-card recent-history features (counts on the card in the last N hours, time since last transaction, and so on) keyed on `card1` or a card hash.
 
-This repo ships a sample payload (`scripts/sample_payload.py`) that
-includes representative `C*`/`D*` values so you can see the model
-actually discriminate. In a real deployment those values come from a
-streaming feature store (Feast, Tecton, or a homegrown Redis + Flink
-setup) — see the **Production scale** section below.
+The repo ships a sample payload (`scripts/sample_payload.py`) that includes representative `C*` and `D*` values, so the model can actually discriminate when you exercise the demo. In a real deployment those values arrive from a streaming feature store (Feast, Tecton, or a homegrown Redis plus Flink setup). The "Production scale" section below covers the rest of the production path.
 
----
+## Production scale
 
-## What changes at production scale
+The following changes carry this design from a working end-to-end build into a production deployment.
 
-This repo is a portfolio-grade end-to-end build. The honest list of what
-would change for real production deployment:
-
-- **Streaming feature store.** Velocity features here are computed offline
-  in pandas. In production these need a low-latency feature store (e.g.
-  Redis-backed Feast, Tecton) keyed on `card1` / `card_hash`, populated by
-  a streaming job (Flink/Kafka) so per-request lookup is O(1) and the
-  feature value is the same offline (training) and online (serving) — the
-  cardinal cause of "trained well, serves badly" model rot.
-- **Model registry + CI/CD for models.** MLflow or W&B model registry,
-  with a "challenger vs. champion" promotion gate that requires the new
-  model to win on a recent shadow-traffic slice across PR-AUC *and* a
-  cohort-stratified false-positive metric (don't ship a model that's better
-  on average but worse on a specific BIN range).
-- **A/B testing thresholds.** Threshold tuning is a per-merchant, per-BIN,
-  per-channel knob, not a global one. Treat `policy.json` as an experiment
-  config — ramp new policies on a percentage of traffic, log the
-  counterfactual (what the old policy would have done), and compare on
-  approval rate, chargeback rate, and review-queue volume.
-- **Drift triggers.** The Evidently report here is run-on-demand. In prod,
-  schedule it hourly/daily on a rolling window of production scoring logs
-  joined to delayed labels (chargebacks land 30–90 days later, so target
-  drift necessarily lags data drift). Alert on PSI > 0.2 on top features
-  *or* a sustained PR-AUC drop on the labelled tail.
-- **Adversarial dynamics.** Fraud is an adversarial process — fraudsters
-  adapt. Retrain weekly, not quarterly. Track the model's calibration over
-  time, not just discrimination — Platt scaling drifts faster than
-  rank-ordering does.
-- **Explainability for chargebacks.** Top-5 SHAP features in JSON is fine
-  for analysts. For chargeback representment you'd render a templated
-  explanation: "this order was flagged because the issuing-bank country
-  differs from the shipping country **and** the device fingerprint had
-  not been seen before for this account."
-- **PII & regulatory.** The IEEE-CIS data is anonymised. A real system
-  needs encryption-at-rest of card hashes, audit logging of every
-  decision for a regulator-friendly retention window, and care with
-  explanation responses — this service currently returns the raw `value`
-  alongside each SHAP contribution, which echoes potentially sensitive
-  feature values back to the caller. Production should redact `value` for
-  external callers and surface it only in the analyst console.
-- **Serving footprint.** The current Docker image bundles SHAP + XGBoost
-  + Evidently. Production split: a light scoring service (XGBoost only,
-  ONNX-converted for ~3× latency improvement) and an async explanation
-  service that backfills SHAP values into the analyst review queue rather
-  than blocking the synchronous decision.
-
----
+- Streaming feature store. Velocity features here are computed offline in pandas. Production needs a low-latency feature store such as Redis-backed Feast or Tecton, keyed on `card1` or a card hash, populated by a streaming job (Flink, Kafka) so per-request lookup runs in O(1) and the feature value matches between training and serving. Feature parity between offline and online is the cardinal cause of "trained well, serves badly" model rot.
+- Model registry plus CI/CD for models. MLflow or Weights & Biases model registry, with a challenger-versus-champion promotion gate. The new model must win on a recent shadow-traffic slice across PR-AUC and a cohort-stratified false-positive metric, so a candidate that is better on average but worse on a specific BIN range fails the gate.
+- A/B testing thresholds. Threshold tuning belongs at the per-merchant, per-BIN, per-channel level, finer-grained than a single global setting. Treat `policy.json` as an experiment config: ramp new policies on a percentage of traffic, log the counterfactual (the decision the prior policy would have made), and compare on approval rate, chargeback rate, and review-queue volume.
+- Drift triggers. The Evidently report runs on demand here. In production, schedule it hourly or daily on a rolling window of production scoring logs joined to delayed labels (chargebacks land 30 to 90 days later, so target drift necessarily lags data drift). Alert on PSI above 0.2 on top features, or on a sustained PR-AUC drop on the labelled tail.
+- Adversarial dynamics. Fraud is an adversarial process. Fraudsters adapt, so a weekly retraining cadence keeps pace with the threat surface where a quarterly cadence falls behind. Track calibration over time alongside discrimination, since Platt scaling drifts faster than rank-ordering.
+- Explainability for chargebacks. The top-5 SHAP features in JSON serve analysts well. For chargeback representment, render a templated explanation, for example: "this order was flagged because the issuing-bank country differs from the shipping country, and the device fingerprint was new on this account."
+- PII and regulatory. The IEEE-CIS data is anonymized. A real system needs encryption at rest for card hashes, audit logging of every decision for a regulator-friendly retention window, and care with explanation responses. This service currently returns the raw `value` alongside each SHAP contribution, which echoes potentially sensitive feature values back to the caller. Production redacts `value` for external callers and surfaces it only in the analyst console.
+- Serving footprint. The current Docker image bundles SHAP, XGBoost, and Evidently. Production splits this in two: a light scoring service (XGBoost only, ONNX-converted for around 3× latency improvement) and an async explanation service that backfills SHAP values into the analyst review queue, so the synchronous decision path stays fast.
 
 ## Tech stack
 
-Python 3.11 · pandas · scikit-learn · XGBoost · SHAP · FastAPI · Pydantic v2 ·
-Streamlit · Plotly · Evidently · joblib · Docker.
+Python 3.11, pandas, scikit-learn, XGBoost, SHAP, FastAPI, Pydantic v2, Streamlit, Plotly, Evidently, joblib, Docker.
