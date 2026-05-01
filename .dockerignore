@@ -1,0 +1,15 @@
+data/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.idea/
+.vscode/
+notebooks/
+tests/
+monitoring/reports/
+*.csv
+*.parquet
+.gitignore
+README.md
